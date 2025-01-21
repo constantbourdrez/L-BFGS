@@ -82,76 +82,8 @@ def gd(problem, stepsize, n_iter=100, verbose=False):
     return np.array(objvals)
 
 
-# Stochastic gradient implementation
-def stoch_grad(problem, stepchoice=0, step0=1, n_epoch = None, n_iter=1000, nb=1, with_replace=False, verbose=True):
-    """
-    Performs stochastic gradient descent optimization.
 
-    Inputs:
-        problem: Problem instance containing loss and objective functions
-        stepchoice: Step size selection strategy
-            0: Constant step size of 1/L
-            t > 0: Decreasing step size 1/(k+1)^t
-        step0: Initial step size
-        n_iter: Number of iterations
-        nb: Batch size for stochastic updates
-        with_replace: If True, samples components with replacement
-        verbose: If True, prints progress at each iteration
-
-    Outputs:
-        x_output: Final iterate of the method
-        objvals: History of objective values
-        normits: History of iterate norms
-    """
-    objvals = []  # Objective value history
-    normits = []  # Norm of iterates history
-    L = problem.lipgrad()  # Lipschitz constant
-    n = problem.n  # Number of components
-    x = problem.x.clone().detach()  # Initial iterate
-
-    obj = problem.obj_func(x).detach()  # Initial objective value
-    objvals.append(obj)
-    nx = torch.norm(x)  # Norm of the iterate
-    normits.append(nx)
-
-    if verbose:
-        print("Stochastic Gradient, batch size =", nb, "/", n)
-        print(' | '.join([name.center(8) for name in ["iter", "fval", "normit"]]))
-        print(' | '.join([("%d" % 0).rjust(8), ("%.2e" % obj).rjust(8), ("%.2e" % nx).rjust(8)]))
-
-    if n_epoch is not None:
-        n_iter = n_epoch * (n // nb)
-
-    for k in range(n_iter):
-        # Draw batch indices
-        ik = np.random.choice(n, nb, replace=with_replace)
-
-        # Compute batch gradient
-        sg = torch.zeros_like(x)
-        for j in range(nb):
-            gi = compute_grad_i(problem.obj_func_i, x, ik[j])
-            sg += gi
-        sg /= nb  # Average gradient over the batch
-
-        # Update step size and iterate
-        if stepchoice == 0:
-            x -= (step0 / L) * sg
-        elif stepchoice > 0:
-            sk = float(step0 / ((k + 1) ** stepchoice))
-            x -= sk * sg
-
-        nx = torch.norm(x)  # Update norm of the iterate
-        obj = problem.obj_func(x).detach()  # Update objective value
-
-        objvals.append(obj)
-        normits.append(nx)
-
-        if verbose and (k + 1) % (n // nb) == 0:
-            print(' | '.join([("%d" % (k + 1)).rjust(8), ("%.2e" % obj).rjust(8), ("%.2e" % nx).rjust(8)]))
-
-    return x.clone().detach(), np.array(objvals), np.array(normits)
-
-def adagrad(problem,xtarget,stepchoice=0,step0=1, n_epoch = None, n_iter=1000,nb=1,average=0,scaling=0,with_replace=False,verbose=False):
+def adv_stoch_grad(problem,xtarget,stepchoice=0,step0=1, n_epoch = None, n_iter=1000,nb=1,average=0,scaling=0,with_replace=False,verbose=False):
     """
         A code for gradient descent with various step choices.
 
@@ -236,7 +168,7 @@ def adagrad(problem,xtarget,stepchoice=0,step0=1, n_epoch = None, n_iter=1000,nb
 
     if n_epoch is not None:
         n_iter = n_epoch*(n//nb)
-
+    compt_epoch = 1
     ################
     # Main loop
     while (k < n_iter and nx < 1e8):
@@ -280,8 +212,10 @@ def adagrad(problem,xtarget,stepchoice=0,step0=1, n_epoch = None, n_iter=1000,nb
 
 
         k += 1
+
         # Plot quantities of interest at the end of every epoch only
-        if (k*nb) % n == 0:
+        if (k*nb) > n*compt_epoch:
+            compt_epoch += 1
             objvals.append(obj)
             normits.append(nmin)
             if verbose:
@@ -385,56 +319,88 @@ def proximal_stochastic_grad(problem, lbda, stepchoice=0, step0=1, n_epoch=None,
 
     return x.clone().detach(), np.array(objvals), np.array(normits)
 
-
-def stochastic_BFGS(problem, stepchoice=0, step0=1, n_epoch=30, nb=1, with_replace=False, verbose=True):
-    N = int(problem.n / nb)
-    x = problem.x.clone().detach()
-    H = torch.eye(problem.d)
-    L = problem.lipgrad()
-    objvals = []
+def stochastic_BFGS(problem, xmin, stepchoice=0, step0=1, n_epoch=30, nb=1, with_replace=False, verbose=True, proximal = False, lbda = None):
+    """
+    Stochastic BFGS implementation with formulas adapted from standard BFGS.
+    """
+    N = int(problem.n / nb)  # Number of mini-batches per epoch
+    x = problem.x.clone().detach().double()  # Initialize x and ensure dtype is double
+    H = torch.eye(problem.d, dtype=torch.float64)  # Initialize Hessian approximation as identity matrix
+    objvals = []  # Store objective function values
+    # iterates distance to the minimum history
+    normits = []
 
     for epoch in range(n_epoch):
         for i in range(N):
+            # Sample mini-batch indices
             ik = torch.randint(0, problem.n, (nb,), generator=None if not with_replace else torch.Generator())
-            sg = torch.zeros(problem.d)
 
+            # Compute stochastic gradient for the mini-batch
+            sg = torch.zeros(problem.d, dtype=torch.float64)
             for j in range(nb):
                 gi = compute_grad_i(problem.obj_func_i, x, ik[j])
                 sg += gi
             sg /= nb
 
+            # Step size adjustment
             if stepchoice == 0:
-                step_size = step0 / L
+                step_size = step0 / problem.lipgrad()  # Lipschitz constant
             else:
                 step_size = step0 / ((epoch * N + i + 1) ** stepchoice)
-
             step_size = max(step_size, 1e-8)
-            delta_x = -step_size * H @ sg
-            x_new = x + delta_x.flatten()
 
-            s = delta_x
-            vg = torch.zeros(problem.d)
+            # Compute search direction and update x
+            p = -step_size * H @ sg
+            x_new = x + p
+
+            # Compute s and y
+            s = (x_new - x).view(-1, 1)
+            vg = torch.zeros(problem.d, dtype=torch.float64)
             for j in range(nb):
-                gi_next = compute_grad_i(problem.obj_func_i, x_new, ik[j])
+                gi_next = compute_grad_i(problem.obj_func_i, x, ik[j])
                 vg += gi_next
             vg /= nb
+            y = (vg - sg).view(-1, 1)
 
-            v = vg - sg
-            s_T_v = s.T @ v
-            if s_T_v > 1e-5:
-                term1 = (v @ s.T) / s_T_v
-                H = (torch.eye(problem.d) - term1) @ H @ (torch.eye(problem.d) - term1.T) + (s @ s.T) / s_T_v
-            else:
-                H = H  # No update if the condition isn't met
+            # Update Hessian approximation H using BFGS formula
+            sT = s.T
+            yT = y.T
+            yT_s = yT @ s
+            if yT_s > 1e-8:
+                rho = 1.0 / yT_s
+                rho2 = rho**2
+                I = torch.eye(problem.d, dtype=torch.float64)
+
+                # Efficient matrix operations to update H
+                H_y = H @ y
+                H_new = (
+                    H
+                    - rho * (H_y @ sT + s @ (yT @ H))
+                    + rho2 * ((s @ (yT @ H_y)) @ sT)
+                    + rho * (s @ sT)
+                )
+                H = H_new
 
             x = x_new
+            if proximal:
+                for i in range(len(x)):
+                    threshold = step_size * lbda
+                    if x[i] < -threshold:
+                        x[i] += threshold
+                    elif x[i] > threshold:
+                        x[i] -= threshold
+                    else:
+                        x[i] = 0
 
+
+        # Compute objective function value
         fval = problem.obj_func(x)
         if not torch.isfinite(fval):
             raise ValueError("Objective function returned non-finite value.")
         objvals.append(fval.item())
+        normits.append(torch.norm(x - xmin).item())
 
         if verbose:
             print(f"Epoch {epoch + 1}/{n_epoch}, Objective value: {fval:.6f}")
 
-    return objvals, x
+    return x, np.array(objvals), np.array(normits)
