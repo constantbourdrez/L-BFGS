@@ -319,16 +319,18 @@ def proximal_stochastic_grad(problem, lbda, stepchoice=0, step0=1, n_epoch=None,
 
     return x.clone().detach(), np.array(objvals), np.array(normits)
 
-def stochastic_BFGS(problem, xmin, stepchoice=0, step0=1, n_epoch=30, nb=1, with_replace=False, verbose=True, proximal = False, lbda = None):
+def stochastic_BFGS(problem, xmin, stepchoice=0, step0=1, n_epoch=30, nb=1, with_replace=False, verbose=True, proximal=False, lbda=None):
     """
-    Stochastic BFGS implementation with formulas adapted from standard BFGS.
+    Stochastic BFGS implementation with optional proximal operator.
     """
     N = int(problem.n / nb)  # Number of mini-batches per epoch
     x = problem.x.clone().detach().double()  # Initialize x and ensure dtype is double
     H = torch.eye(problem.d, dtype=torch.float64)  # Initialize Hessian approximation as identity matrix
     objvals = []  # Store objective function values
-    # iterates distance to the minimum history
     normits = []
+
+    if proximal and lbda is None:
+        raise ValueError("Proximal mode requires a non-null lbda parameter.")
 
     for epoch in range(n_epoch):
         for i in range(N):
@@ -357,7 +359,7 @@ def stochastic_BFGS(problem, xmin, stepchoice=0, step0=1, n_epoch=30, nb=1, with
             s = (x_new - x).view(-1, 1)
             vg = torch.zeros(problem.d, dtype=torch.float64)
             for j in range(nb):
-                gi_next = compute_grad_i(problem.obj_func_i, x, ik[j])
+                gi_next = compute_grad_i(problem.obj_func_i, x_new, ik[j])
                 vg += gi_next
             vg /= nb
             y = (vg - sg).view(-1, 1)
@@ -381,17 +383,12 @@ def stochastic_BFGS(problem, xmin, stepchoice=0, step0=1, n_epoch=30, nb=1, with
                 )
                 H = H_new
 
-            x = x_new
+            # Apply proximal operator if enabled
             if proximal:
-                for i in range(len(x)):
-                    threshold = step_size * lbda
-                    if x[i] < -threshold:
-                        x[i] += threshold
-                    elif x[i] > threshold:
-                        x[i] -= threshold
-                    else:
-                        x[i] = 0
+                threshold = step_size * lbda
+                x_new = torch.sign(x_new) * torch.clamp(x_new.abs() - threshold, min=0)
 
+            x = x_new
 
         # Compute objective function value
         fval = problem.obj_func(x)
