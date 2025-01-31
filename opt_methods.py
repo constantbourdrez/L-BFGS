@@ -319,18 +319,36 @@ def proximal_stochastic_grad(problem, lbda, stepchoice=0, step0=1, n_epoch=None,
 
     return x.clone().detach(), np.array(objvals), np.array(normits)
 
-def stochastic_BFGS(problem, xmin, stepchoice=0, step0=1, n_epoch=30, nb=1, with_replace=False, verbose=True, proximal=False, lbda=None):
+def stochastic_BFGS(problem, xmin, stepchoice=0, step0=1, n_epoch=30, nb=1, with_replace=False, verbose=True, proximal = False, lbda = None):
     """
-    Stochastic BFGS implementation with optional proximal operator.
+    Stochastic BFGS implementation with formulas adapted from standard BFGS.
+    Parameters:
+        problem (object): An optimization problem instance
+        xmin (torch.Tensor): Known optimal solution (for convergence monitoring).
+        stepchoice (int, optional): Step size adaptation strategy.
+                                    - 0: Uses a step size proportional to the inverse Lipschitz constant.
+                                    - Other values: Uses a decreasing step size of the form `step0 / (iteration_count ^ stepchoice)`.
+                                    Default is 0.
+        step0 (float, optional): Initial step size scaling factor. Default is 1.
+        n_epoch (int, optional): Number of training epochs. Default is 30.
+        nb (int, optional): Mini-batch size. Default is 1.
+        with_replace (bool, optional): Whether to sample with replacement. Default is False.
+        verbose (bool, optional): If True, prints optimization progress. Default is True.
+        proximal (bool, optional): If True, applies proximal updates (e.g., for regularization). Default is False.
+        lbda (float, optional): Regularization parameter for proximal updates. Required if `proximal=True`.
+
+    Returns:
+        torch.Tensor: Optimized variable `x`.
+        numpy.ndarray: Objective function values over iterations.
+        numpy.ndarray: Distance of iterates from `xmin` over iterations.
+
     """
     N = int(problem.n / nb)  # Number of mini-batches per epoch
     x = problem.x.clone().detach().double()  # Initialize x and ensure dtype is double
     H = torch.eye(problem.d, dtype=torch.float64)  # Initialize Hessian approximation as identity matrix
     objvals = []  # Store objective function values
+    # iterates distance to the minimum history
     normits = []
-
-    if proximal and lbda is None:
-        raise ValueError("Proximal mode requires a non-null lbda parameter.")
 
     for epoch in range(n_epoch):
         for i in range(N):
@@ -359,12 +377,12 @@ def stochastic_BFGS(problem, xmin, stepchoice=0, step0=1, n_epoch=30, nb=1, with
             s = (x_new - x).view(-1, 1)
             vg = torch.zeros(problem.d, dtype=torch.float64)
             for j in range(nb):
-                gi_next = compute_grad_i(problem.obj_func_i, x_new, ik[j])
+                gi_next = compute_grad_i(problem.obj_func_i, x, ik[j])
                 vg += gi_next
             vg /= nb
             y = (vg - sg).view(-1, 1)
 
-            # Update Hessian approximation H using BFGS formula
+
             sT = s.T
             yT = y.T
             yT_s = yT @ s
@@ -373,7 +391,7 @@ def stochastic_BFGS(problem, xmin, stepchoice=0, step0=1, n_epoch=30, nb=1, with
                 rho2 = rho**2
                 I = torch.eye(problem.d, dtype=torch.float64)
 
-                # Efficient matrix operations to update H
+                # Hessian update
                 H_y = H @ y
                 H_new = (
                     H
@@ -383,14 +401,19 @@ def stochastic_BFGS(problem, xmin, stepchoice=0, step0=1, n_epoch=30, nb=1, with
                 )
                 H = H_new
 
-            # Apply proximal operator if enabled
-            if proximal:
-                threshold = step_size * lbda
-                x_new = torch.sign(x_new) * torch.clamp(x_new.abs() - threshold, min=0)
-
             x = x_new
+            if proximal:
+                for i in range(len(x)):
+                    threshold = step_size * lbda
+                    if x[i] < -threshold:
+                        x[i] += threshold
+                    elif x[i] > threshold:
+                        x[i] -= threshold
+                    else:
+                        x[i] = 0
 
-        # Compute objective function value
+
+
         fval = problem.obj_func(x)
         if not torch.isfinite(fval):
             raise ValueError("Objective function returned non-finite value.")
@@ -399,5 +422,120 @@ def stochastic_BFGS(problem, xmin, stepchoice=0, step0=1, n_epoch=30, nb=1, with
 
         if verbose:
             print(f"Epoch {epoch + 1}/{n_epoch}, Objective value: {fval:.6f}")
+
+    return x, np.array(objvals), np.array(normits)
+
+def stochastic_LBFGS(problem, xmin, memory_size=5, c=0.0001, theta=0.5, n_epoch=30, nb=32, verbose=True, proximal = False, lbda = None):
+    """
+    Stochastic L-BFGS optimization algorithm.
+
+    This function implements a stochastic variant of the Limited-memory BFGS (L-BFGS)
+    algorithm, which approximates the inverse Hessian using a history of recent updates.
+
+
+    Parameters:
+        problem (object): An optimization problem instance with methods `obj_func_i`
+                          (per-sample objective) and `compute_grad_i`.
+        xmin (torch.Tensor): Known optimal solution (for convergence monitoring).
+        memory_size (int, optional): Number of past updates to store in memory (controls
+                                     Hessian approximation quality). Default is 5.
+        c (float, optional): Sufficient decrease parameter for backtracking line search. Default is 0.0001.
+        theta (float, optional): Reduction factor for step size in backtracking. Default is 0.5.
+        n_epoch (int, optional): Number of training epochs. Default is 30.
+        nb (int, optional): Mini-batch size. Default is 32.
+        verbose (bool, optional): If True, prints optimization progress. Default is True.
+        proximal (bool, optional): If True, applies proximal updates (e.g., for regularization). Default is False.
+        lbda (float, optional): Regularization parameter for proximal updates. Required if `proximal=True`.
+
+    Returns:
+        torch.Tensor: Optimized variable `x`.
+        numpy.ndarray: Objective function values over iterations.
+        numpy.ndarray: Distance of iterates from `xmin` over iterations.
+    """
+    N = int(problem.n / nb)  # Number of mini-batches per epoch
+    x = problem.x.clone().detach().double()  # Initialize x and ensure dtype is double
+    objvals = []  # Store objective function values
+    normits = []  # Store iterates distance to the minimum history
+    sk_memory = []
+    yk_memory = []
+    rho_memory = []
+
+    for epoch in range(n_epoch):
+        for j in range(N):
+            # Sample mini-batch indices
+            ik = torch.randint(0, problem.n, (nb,), dtype=torch.long)
+
+            # Compute stochastic gradient for the mini-batch
+            sg = torch.zeros(problem.d, dtype=torch.float64)
+            for j in range(nb):
+                gi = compute_grad_i(problem.obj_func_i, x, ik[j])
+                sg += gi
+            sg /= nb
+
+            # L-BFGS Two-loop recursion
+            q = sg.clone()
+            alphas = []
+
+            for i in reversed(range(len(sk_memory))):
+                rho = rho_memory[i]
+                alpha = rho * torch.dot(sk_memory[i], q)
+                alphas.append(alpha)
+                q -= alpha * yk_memory[i]
+
+            # Approximate Hessian initialization (scaling)
+            if len(sk_memory) > 0:
+                gamma = torch.dot(sk_memory[-1], yk_memory[-1]) / torch.dot(yk_memory[-1], yk_memory[-1])
+                q *= gamma
+
+            # Second loop to compute search direction
+            for i in range(len(sk_memory)):
+                rho = rho_memory[i]
+                beta = rho * torch.dot(yk_memory[i], q)
+                q += sk_memory[i] * (alphas[len(sk_memory) - 1 - i] - beta)
+
+            direction = -q
+
+            # Perform line search (simple backtracking)
+            step_size = 1.0
+            while problem.obj_func(x + step_size * direction) > problem.obj_func(x) + c * step_size * torch.dot(sg, direction):
+                step_size *= theta  #Got rid of the stepchoice since it wasn't working here
+
+            x_new = x + step_size * direction
+            sk = x_new - x
+
+            # Compute new stochastic gradient
+            vg = torch.zeros(problem.d, dtype=torch.float64)
+            for j in range(nb):
+                gi_next = compute_grad_i(problem.obj_func_i, x_new, ik[j])
+                vg += gi_next
+            vg /= nb
+            yk = vg - sg
+
+            # Update memory
+            if len(sk_memory) >= memory_size:
+                sk_memory.pop(0)
+                yk_memory.pop(0)
+                rho_memory.pop(0)
+            sk_memory.append(sk)
+            yk_memory.append(yk)
+            rho_memory.append(1.0 / torch.dot(yk, sk))
+
+            x = x_new
+            if proximal:
+                for i in range(len(x)):
+                    threshold = step_size * lbda
+                    if x[i] < -threshold:
+                        x[i] += threshold
+                    elif x[i] > threshold:
+                        x[i] -= threshold
+                    else:
+                        x[i] = 0
+
+            if verbose:
+                print(f"Iteration {batch + epoch * N}: objective = {problem.obj_func(x).item()}")
+
+        f = problem.obj_func(x)
+        objvals.append(f.item())
+        normits.append(torch.norm(x - xmin).item())
 
     return x, np.array(objvals), np.array(normits)
